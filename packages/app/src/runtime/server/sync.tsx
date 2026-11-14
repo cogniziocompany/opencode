@@ -18,7 +18,9 @@ import { persisted } from "@/runtime/persistence/storage"
 import type { ServerApi } from "@/runtime/server/api"
 import { toggleMcp } from "./global-sync/mcp"
 import { createConnectionSync, reconnectOrder } from "./server-sync/connection"
+import { ServerConnection } from "./registry"
 import { usePlatform } from "@/runtime/platform/platform"
+import { useTabs } from "@/shell/tabs/tabs"
 import type { Data } from "@opencode/client/solid"
 import { createWorktreeInventory, withWorktreeInventory, worktreeInventoryViewKey } from "@/workspaces/inventory"
 
@@ -50,6 +52,7 @@ export type QueryOptionsApi = ReturnType<typeof makeQueryOptionsApi>
 export function createServerSyncContextInner(serverSDK: ServerSDK, data: Data) {
   const language = useLanguage()
   const platform = usePlatform()
+  const tabs = useTabs()
   const owner = getOwner()
 
   if (!owner) throw new Error("ServerSync must be created within owner")
@@ -184,6 +187,34 @@ export function createServerSyncContextInner(serverSDK: ServerSDK, data: Data) {
       reconnectOrder(Object.keys(children.children).filter(children.active), children.pinned).forEach((directory) =>
         queue.push(directory),
       )
+
+      // A reconnect means the server may have restarted under this tab: the session catalog and the
+      // transcripts this window already holds can be stale or half-fetched from the outage. Refetch
+      // them now; a transcript that fails to come back gets a page reload rather than an empty pane.
+      if (!info.reconnect) return
+
+      const open = untrack(() => tabs.store.filter((tab) => tab.type === "session")).flatMap((tab) =>
+        tab.server === ServerConnection.key(serverSDK.server) ? [tab.sessionId] : [],
+      )
+
+      const list = queryClient.invalidateQueries({
+        predicate: (query) => query.queryKey[0] === "home-sessions",
+        refetchType: "all",
+      })
+
+      const transcripts = Promise.allSettled(
+        open.map((sessionID) =>
+          Promise.all([data.session.message.sync(sessionID), data.session.pending.sync(sessionID)]),
+        ),
+      )
+
+      void Promise.all([list, transcripts]).then(([_, settled]) => {
+        const failed = settled.filter((item) => item.status === "rejected")
+
+        if (failed.length === 0) return
+        console.error("[server-sync] transcript refetch after reconnect failed; reloading", failed.length)
+        void platform.restart()
+      })
     },
   })
 
